@@ -31,13 +31,14 @@ Either way the whole run is one undo step.
 import adsk.core
 import adsk.fusion
 import contextlib
+import json
 import math
 import os
 import re
 import time
 import traceback
 
-SHRINKWRAP_VERSION = '1.2.1'
+SHRINKWRAP_VERSION = '1.2.3'
 
 CMD_ID = 'DaneccaShrinkwrapCmd'
 CMD_NAME = 'Shrinkwrap'
@@ -83,6 +84,11 @@ LOG_RAYS_EVERY = 500            # rays between envelope progress lines in the lo
 # Run logs: one file per run, newest LOG_KEEP kept.
 LOG_DIR = os.path.join(os.path.expanduser('~'), 'Documents', 'Shrinkwrap logs')
 LOG_KEEP = 30
+# Bodies whose union froze Fusion, per design, skipped in later runs. Written
+# by the freeze recovery below; delete an entry (or the file) to retry it.
+PROBLEM_FILE = os.path.join(LOG_DIR, 'problem bodies.json')
+# Names the body being united; left behind only if Fusion dies mid-union.
+PENDING_FILE = os.path.join(LOG_DIR, 'union in progress.json')
 
 # Dialog inputs
 INPUT_COM = 'add_com'
@@ -398,45 +404,131 @@ def _boolean(tbm, target, tool, boolean_type):
         return False
 
 
-def _union_bodies(tbm, bodies, progress):
-    """Unite all bodies into one temporary body.
+# ----------------------------------------------------------------------------
+# Freeze recovery
+#
+# Fusion's geometry engine can hang for good on some unions (e.g. a nut whose
+# bore sits exactly on a thread cylinder), and Python can't interrupt it. So
+# before each union the body is named in PENDING_FILE, which is removed again
+# afterwards. If Fusion dies mid-union the file survives; the next run moves
+# that body into PROBLEM_FILE, and bodies listed there for the design are
+# skipped from then on (their mass still counts).
+# ----------------------------------------------------------------------------
 
-    Returns (result_body, failed_names). Returns (None, ...) if cancelled.
+def _load_problems():
+    try:
+        with open(PROBLEM_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        _log(f'Could not read {PROBLEM_FILE}: {e}')
+        return {}
+
+
+def _save_problems(data):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    tmp = PROBLEM_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, PROBLEM_FILE)
+
+
+def _recover_from_freeze():
+    """If the last run died mid-union, record that body as a problem.
+
+    Returns (design_key, body_label) of the recovered body, or None.
+    """
+    try:
+        with open(PENDING_FILE, encoding='utf-8') as f:
+            pending = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        pending = {}
+    _clear_pending()
+    design_key, label = pending.get('design'), pending.get('body')
+    if not (design_key and label):
+        return None
+    data = _load_problems()
+    labels = data.setdefault(design_key, [])
+    if label not in labels:
+        labels.append(label)
+        _save_problems(data)
+    _log(f'Previous run froze while uniting "{label}" in "{design_key}"; '
+         'it will be skipped from now on.')
+    return design_key, label
+
+
+def _mark_pending(design_key, label):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(PENDING_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'design': design_key, 'body': label,
+                       'started': time.strftime('%Y-%m-%d %H:%M:%S')}, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+
+
+def _clear_pending():
+    try:
+        os.remove(PENDING_FILE)
+    except Exception:
+        pass
+
+
+def _union_bodies(tbm, bodies, progress, design_key, skip):
+    """Unite all bodies into one temporary body, leaving out labels in skip.
+
+    Returns (result_body, failed_names, skipped_names). result_body is None if
+    cancelled.
     """
     result = None
     failed = []
+    skipped = []
     n = len(bodies)
-    for i, body in enumerate(bodies):
-        progress.progressValue = i
-        adsk.doEvents()
-        if progress.wasCancelled:
-            _log('Union cancelled by user.')
-            return None, failed
+    try:
+        for i, body in enumerate(bodies):
+            progress.progressValue = i
+            adsk.doEvents()
+            if progress.wasCancelled:
+                _log('Union cancelled by user.')
+                return None, failed, skipped
 
-        # Logged before the slow calls, so a freeze leaves this as the last line.
-        label = _body_label(body)
-        _log(f'Union {i + 1}/{n}: "{label}" ({_describe_body(body)})')
-        start = time.perf_counter()
-        tmp = _root_space_copy(tbm, body)
-        if tmp is None:
-            failed.append(label)
-            _log(f'  copy FAILED')
-            continue
-        if result is None:
-            result = tmp
-            _log(f'  first body ({time.perf_counter() - start:.2f} s)')
-            continue
-        backup = tbm.copy(result)
-        if _boolean(tbm, result, tmp, adsk.fusion.BooleanTypes.UnionBooleanType):
-            _log(f'  united ({time.perf_counter() - start:.2f} s); '
-                 f'result now {result.faces.count} faces')
-        else:
-            result = backup
-            failed.append(label)
-            _log(f'  union FAILED ({time.perf_counter() - start:.2f} s); body left out')
+            # Logged before the slow calls, so a freeze leaves this as the last line.
+            label = _body_label(body)
+            if label in skip:
+                skipped.append(label)
+                _log(f'Union {i + 1}/{n}: "{label}" SKIPPED (froze Fusion in an earlier run)')
+                continue
+            _log(f'Union {i + 1}/{n}: "{label}" ({_describe_body(body)})')
+            _mark_pending(design_key, label)
+            start = time.perf_counter()
+            tmp = _root_space_copy(tbm, body)
+            if tmp is None:
+                failed.append(label)
+                _log(f'  copy FAILED')
+                continue
+            if result is None:
+                result = tmp
+                _log(f'  first body ({time.perf_counter() - start:.2f} s)')
+                continue
+            backup = tbm.copy(result)
+            if _boolean(tbm, result, tmp, adsk.fusion.BooleanTypes.UnionBooleanType):
+                _log(f'  united ({time.perf_counter() - start:.2f} s); '
+                     f'result now {result.faces.count} faces')
+            else:
+                result = backup
+                failed.append(label)
+                _log(f'  union FAILED ({time.perf_counter() - start:.2f} s); body left out')
+    finally:
+        _clear_pending()
 
     progress.progressValue = n
-    return result, failed
+    return result, failed, skipped
 
 
 def _union_all(tbm, bodies, what):
@@ -1029,13 +1121,19 @@ def _run_shrinkwrap(design, add_com, envelope, detail, wall, manual_mass):
         if target_mass <= 0:
             raise ShrinkwrapError('The visible bodies have zero total mass.')
 
+    design_key = _base_name(design)
+    recovered = _recover_from_freeze()
+    skip = set(_load_problems().get(design_key, []))
+    if skip:
+        _log(f'{len(skip)} problem bodies will be skipped for "{design_key}"')
+
     tbm = adsk.fusion.TemporaryBRepManager.get()
     progress = ui.createProgressDialog()
     progress.isCancelButtonShown = True
     progress.show('Shrinkwrap', 'Uniting body %v of %m', 0, len(bodies))
     try:
         with timings.phase('Union'):
-            merged, failed = _union_bodies(tbm, bodies, progress)
+            merged, failed, skipped = _union_bodies(tbm, bodies, progress, design_key, skip)
     finally:
         progress.hide()
     if progress.wasCancelled:
@@ -1073,7 +1171,7 @@ def _run_shrinkwrap(design, add_com, envelope, detail, wall, manual_mass):
     lines = [
         f'Created component "{comp.name}".',
         '',
-        f'Bodies united: {len(bodies) - len(failed)} of {len(bodies)}',
+        f'Bodies united: {len(bodies) - len(failed) - len(skipped)} of {len(bodies)}',
         f'Sealed cavities filled: {cavities}',
     ]
     if envelope_info:
@@ -1097,6 +1195,14 @@ def _run_shrinkwrap(design, add_com, envelope, detail, wall, manual_mass):
         more = f'\n  ...and {len(failed) - 10} more' if len(failed) > 10 else ''
         notes.append(f'{len(failed)} bodies could not be united and are missing '
                      f'from the shape (their mass is still counted):\n  {shown}{more}')
+    if recovered:
+        notes.append(f'The previous Shrinkwrap run froze Fusion while uniting '
+                     f'"{recovered[1]}" ({recovered[0]}). That body is now on the skip list.')
+    if skipped:
+        notes.append(f'{len(skipped)} bodies were skipped because uniting them froze Fusion '
+                     f'in an earlier run; they are missing from the shape but their mass '
+                     f'is still counted:\n  ' + '\n  '.join(skipped) +
+                     f'\n  To retry them, remove them from "{PROBLEM_FILE}".')
     if cavity_warning:
         notes.append(cavity_warning)
     if envelope_warning:
@@ -1388,7 +1494,9 @@ class ShrinkwrapCreatedHandler(adsk.core.CommandCreatedEventHandler):
                         'Material density is worked out from the chosen mass.')
             else:
                 info = 'Material density is worked out from the chosen mass.'
-            inputs.addTextBoxCommandInput(INPUT_INFO, '', info, 3, True)
+            info += ('<br><b>If Fusion freezes, restart it and run Shrinkwrap again</b> '
+                     '(save first). The part that caused the freeze is skipped next time.')
+            inputs.addTextBoxCommandInput(INPUT_INFO, '', info, 4, True)
 
             for event, handler in ((cmd.execute, ShrinkwrapExecuteHandler()),
                                    (cmd.inputChanged, ShrinkwrapInputChangedHandler()),

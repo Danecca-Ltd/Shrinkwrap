@@ -1,6 +1,6 @@
 # Shrinkwrap
 
-Fusion add-in with two buttons in **Solid → Modify**. Version 1.2.1.
+Fusion add-in with two buttons in **Solid → Modify**. Version 1.2.3.
 
 - **Shrinkwrap** turns the open part or assembly into one solid body in a new internal
   component, with the same mass and a marker at the original center of mass. On a design
@@ -36,6 +36,9 @@ Fusion add-in with two buttons in **Solid → Modify**. Version 1.2.1.
 
 The dialog remembers your last choices until Fusion is restarted. The summary ends with the
 total time and a per-step breakdown.
+
+The dialog also reminds you: **if Fusion freezes, restart it and run Shrinkwrap again**
+(save first) — the part that caused the freeze is skipped automatically (see *Logs*).
 
 ## Assembly mode (what Shrinkwrap does)
 
@@ -84,8 +87,16 @@ Every Shrinkwrap and Set Mass run writes a log to `Documents\Shrinkwrap logs\` (
 30 are kept; the summary shows the file name). Each line is written to disk immediately,
 so if Fusion freezes or crashes the log still ends with the step it was on — for example
 `Union 57/58: "Sub / Bracket:1" (412 faces, ...)` with no `united` line after it means
-Fusion got stuck uniting that body. Hide that body (hidden bodies are skipped) and run
-again. Errors are logged with their full traceback.
+Fusion got stuck uniting that body. Errors are logged with their full traceback.
+
+**Freeze recovery.** Fusion's geometry engine can hang for good on some unions (typically
+a nut whose bore sits exactly on a thread cylinder), and an add-in can't interrupt it.
+So Shrinkwrap names each body in `union in progress.json` before uniting it and removes
+the file afterwards. If Fusion dies mid-union, the next run finds the file, adds that body
+to `problem bodies.json` for that design, and skips it from then on — the summary lists
+skipped bodies, which are missing from the shape but still count towards the mass. One
+freeze per problem body, never a repeat. To retry a body, delete its entry (or the whole
+file); both files are in the log folder.
 
 ## Limits
 
