@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ApplicationPackage SchemaVersion="1.0"
+	ProductType="Application"
+	AutodeskProduct="Fusion360"
+	Name="Shrinkwrap"
+	Description="Shrinkwrap a part or assembly into one solid body with matching mass, and set any body's mass by adjusting its material density"
+	AppVersion="1.2.0"
+	Author="Danecca Ltd"
+	AppNameSpace="com.danecca.shrinkwrap"
+	OnlineDocumentation=""
+	ProductCode="*"
+	UpgradeCode="{B30FC90E-1DD4-459B-B42E-BB4ABD824398}" >
+
+	<CompanyDetails Name="Danecca Ltd"
+		Phone=" "
+		Url=""
+		Email="" />
+
+	<RuntimeRequirements SupportPath="./Contents" OS="win64|mac" Platform="Fusion360" SeriesMin=""  />
+
+	<Components>
+		<RuntimeRequirements SupportPath="./Contents" OS="win64|mac" Platform="Fusion360" SeriesMin="" />
+		<ComponentEntry AppName="Shrinkwrap" Version="1.2.0" ModuleName="./Contents/Shrinkwrap.manifest" AppDescription="Shrinkwrap a part or assembly into one solid body with matching mass, and set any body's mass by adjusting its material density" />
+	</Components>
+
+</ApplicationPackage>
