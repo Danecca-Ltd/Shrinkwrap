@@ -1,6 +1,6 @@
 # Shrinkwrap
 
-Fusion add-in with two buttons in **Solid → Modify**. Version 1.2.0.
+Fusion add-in with two buttons in **Solid → Modify**. Version 1.2.1.
 
 - **Shrinkwrap** turns the open part or assembly into one solid body in a new internal
   component, with the same mass and a marker at the original center of mass. On a design
@@ -77,6 +77,15 @@ mass, OK. The bodies get a material of their own — a copy of their current mat
 `<component> material` (`<design> material` for root bodies), or the existing one if it
 already has that name or was made by Shrinkwrap — and its density is tuned so the
 selection weighs exactly that. Other bodies sharing the original material are unaffected.
+
+## Logs
+
+Every Shrinkwrap and Set Mass run writes a log to `Documents\Shrinkwrap logs\` (the newest
+30 are kept; the summary shows the file name). Each line is written to disk immediately,
+so if Fusion freezes or crashes the log still ends with the step it was on — for example
+`Union 57/58: "Sub / Bracket:1" (412 faces, ...)` with no `united` line after it means
+Fusion got stuck uniting that body. Hide that body (hidden bodies are skipped) and run
+again. Errors are logged with their full traceback.
 
 ## Limits
 

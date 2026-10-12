@@ -32,11 +32,12 @@ import adsk.core
 import adsk.fusion
 import contextlib
 import math
+import os
 import re
 import time
 import traceback
 
-SHRINKWRAP_VERSION = '1.2.0'
+SHRINKWRAP_VERSION = '1.2.1'
 
 CMD_ID = 'DaneccaShrinkwrapCmd'
 CMD_NAME = 'Shrinkwrap'
@@ -77,6 +78,11 @@ ENVELOPE_SNAP = 0.001           # fill boundaries snap (inwards) to a 10 µm gri
 ENVELOPE_ROUND = 6              # strips float noise so equal spans compare equal
 ENVELOPE_MIN_THICKNESS = 1e-4   # ignore cells thinner than this
 PROGRESS_EVERY = 20             # rays between progress updates / cancel checks
+LOG_RAYS_EVERY = 500            # rays between envelope progress lines in the log
+
+# Run logs: one file per run, newest LOG_KEEP kept.
+LOG_DIR = os.path.join(os.path.expanduser('~'), 'Documents', 'Shrinkwrap logs')
+LOG_KEEP = 30
 
 # Dialog inputs
 INPUT_COM = 'add_com'
@@ -103,10 +109,96 @@ def _app():
 
 
 def _log(msg):
+    """Log to the Text Commands window and, during a run, to the run's log file."""
     try:
         _app().log(f'[Shrinkwrap] {msg}')
     except Exception:
         pass
+    if _run_log:
+        _run_log.write(msg)
+
+
+class _RunLog:
+    """One log file per run, flushed to disk after every line.
+
+    If Fusion freezes or crashes mid-run, the file still ends with the last
+    step that started, which is the one it got stuck on.
+    """
+
+    def __init__(self, title):
+        os.makedirs(LOG_DIR, exist_ok=True)
+        stamp = time.strftime('%Y-%m-%d_%H-%M-%S')
+        self.path = os.path.join(LOG_DIR, f'{title.lower().replace(" ", "-")}_{stamp}.log')
+        self._file = open(self.path, 'a', encoding='utf-8')
+        self._start = time.perf_counter()
+        self._prune()
+
+    def write(self, msg):
+        try:
+            elapsed = time.perf_counter() - self._start
+            self._file.write(f'{time.strftime("%H:%M:%S")} +{elapsed:8.1f}s  {msg}\n')
+            self._file.flush()
+            os.fsync(self._file.fileno())
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self._file.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _prune():
+        """Keep only the newest LOG_KEEP log files."""
+        try:
+            logs = sorted((f for f in os.listdir(LOG_DIR) if f.endswith('.log')),
+                          key=lambda f: os.path.getmtime(os.path.join(LOG_DIR, f)))
+            for name in logs[:-LOG_KEEP]:
+                os.remove(os.path.join(LOG_DIR, name))
+        except Exception:
+            pass
+
+
+_run_log = None  # the _RunLog of the run in progress, if any
+
+
+@contextlib.contextmanager
+def _logged_run(title):
+    """Open a run log for the duration of a command, and log any crash in it."""
+    global _run_log
+    try:
+        _run_log = _RunLog(title)
+    except Exception:
+        _run_log = None
+    try:
+        app = _app()
+        doc = app.activeDocument
+        _log(f'{title} v{SHRINKWRAP_VERSION} | Fusion {app.version} | '
+             f'document "{doc.name if doc else "?"}"')
+        yield _run_log
+        _log('Finished.')
+    except Exception:
+        _log('Stopped with an error:\n' + traceback.format_exc())
+        raise
+    finally:
+        if _run_log:
+            _run_log.close()
+        _run_log = None
+
+
+def _log_path_line():
+    return f'Log: {_run_log.path}' if _run_log else ''
+
+
+def _describe_body(body):
+    """Size facts about a body for the log (cheap properties only)."""
+    try:
+        box = body.boundingBox
+        size = box.maxPoint.vectorTo(box.minPoint).length * 10
+        return f'{body.faces.count} faces, {body.edges.count} edges, {size:.0f} mm across'
+    except Exception as e:
+        return f'(could not describe: {e})'
 
 
 class ShrinkwrapError(Exception):
@@ -313,27 +405,37 @@ def _union_bodies(tbm, bodies, progress):
     """
     result = None
     failed = []
+    n = len(bodies)
     for i, body in enumerate(bodies):
         progress.progressValue = i
         adsk.doEvents()
         if progress.wasCancelled:
+            _log('Union cancelled by user.')
             return None, failed
 
+        # Logged before the slow calls, so a freeze leaves this as the last line.
         label = _body_label(body)
+        _log(f'Union {i + 1}/{n}: "{label}" ({_describe_body(body)})')
+        start = time.perf_counter()
         tmp = _root_space_copy(tbm, body)
         if tmp is None:
             failed.append(label)
+            _log(f'  copy FAILED')
             continue
         if result is None:
             result = tmp
+            _log(f'  first body ({time.perf_counter() - start:.2f} s)')
             continue
         backup = tbm.copy(result)
-        if not _boolean(tbm, result, tmp, adsk.fusion.BooleanTypes.UnionBooleanType):
+        if _boolean(tbm, result, tmp, adsk.fusion.BooleanTypes.UnionBooleanType):
+            _log(f'  united ({time.perf_counter() - start:.2f} s); '
+                 f'result now {result.faces.count} faces')
+        else:
             result = backup
             failed.append(label)
-            _log(f'Union failed for {label}')
+            _log(f'  union FAILED ({time.perf_counter() - start:.2f} s); body left out')
 
-    progress.progressValue = len(bodies)
+    progress.progressValue = n
     return result, failed
 
 
@@ -344,6 +446,7 @@ def _union_all(tbm, bodies, what):
     that won't unite keeps the first body and drops the second.
     """
     bodies = [b for b in bodies if b]
+    _log(f'{what}: uniting {len(bodies)} boxes')
     while len(bodies) > 1:
         merged = []
         for a, b in zip(bodies[0::2], bodies[1::2]):
@@ -372,6 +475,7 @@ def _fill_cavities(tbm, body):
                 cavities += 1
                 void_faces.extend(shell.faces)
 
+    _log(f'Sealed cavities: {cavities} found ({len(void_faces)} faces)')
     if not void_faces:
         return body, 0, None
 
@@ -431,6 +535,8 @@ class _RayCaster:
             origin, direction, adsk.fusion.BRepEntityTypes.BRepFaceEntityType,
             -1.0, True, hit_points)
         self.count += 1
+        if self.count % LOG_RAYS_EVERY == 0:
+            _log(f'  {self.count} rays cast')
         if self.progress:
             self.progress.tick(self.count)
         hits = [_coord(hit_points.item(i), axis)
@@ -568,6 +674,7 @@ def _axis_fill(tbm, caster, mn, mx, axis, cell, timings):
     du = (mx[u] - mn[u]) / nu
     dv = (mx[v] - mn[v]) / nv
     direction = _unit(axis)
+    _log(f'Envelope axis {"XYZ"[axis]}: {(nu + 1) * (nv + 1)} rays on a {nu} x {nv} grid')
 
     with timings.phase('Envelope rays'):
         nodes = [[None] * (nv + 1) for _ in range(nu + 1)]
@@ -590,7 +697,7 @@ def _axis_fill(tbm, caster, mn, mx, axis, cell, timings):
                 _make_point(center), _unit(u), _unit(v),
                 (i1 - i0 + 1) * du, (j1 - j0 + 1) * dv, hi - lo)
             boxes.append(tbm.createBox(obb))
-        return _union_all(tbm, boxes, f'Envelope axis {axis}')
+        return _union_all(tbm, boxes, f'Envelope axis {"XYZ"[axis]}')
 
 
 def _envelope_fill(tbm, root, merged, accept, detail, wall, timings):
@@ -623,6 +730,7 @@ def _envelope_fill(tbm, root, merged, accept, detail, wall, timings):
     if any(f is None for f in fills):
         return merged, info, 'Envelope found nothing to fill (is the wall thickness too large?).'
 
+    _log('Envelope: intersecting the X, Y and Z fills')
     with timings.phase('Envelope boxes'):
         fill = fills[0]
         for other in fills[1:]:
@@ -631,6 +739,7 @@ def _envelope_fill(tbm, root, merged, accept, detail, wall, timings):
     if fill.volume <= 0:
         return merged, info, 'Envelope found nothing to fill (is the wall thickness too large?).'
 
+    _log(f'Envelope: merging the fill ({fill.faces.count} faces) into the body')
     with timings.phase('Envelope merge'):
         backup = tbm.copy(merged)
         merged_ok = _boolean(tbm, merged, fill, adsk.fusion.BooleanTypes.UnionBooleanType) \
@@ -900,11 +1009,16 @@ def _run_shrinkwrap(design, add_com, envelope, detail, wall, manual_mass):
     """
     ui = _app().userInterface
     timings = _Timings()
+    _log(f'Assembly mode | fill: {"envelope" if envelope else "sealed only"} | '
+         f'detail: {detail} | wall: {wall * 10:.3g} mm | center of mass: {add_com} | '
+         f'mass: {"manual %.6g kg" % manual_mass if manual_mass is not None else "inherit"}')
     with timings.phase('Mass'):
         bodies, hidden, non_solid = _collect_bodies(design)
         if not bodies:
             raise ShrinkwrapError('No visible solid bodies found in this design.')
+        _log(f'{len(bodies)} visible solid bodies ({hidden} hidden, {non_solid} non-solid ignored)')
         model_mass, com_point = _mass_properties(bodies)
+        _log(f'Model mass {model_mass:.6g} kg')
 
     if not add_com:
         com_point = None
@@ -941,6 +1055,7 @@ def _run_shrinkwrap(design, add_com, envelope, detail, wall, manual_mass):
         merged, envelope_info, envelope_warning = result
 
     base_name = _base_name(design)
+    _log(f'Creating component "{base_name} shrinkwrap" ({merged.faces.count} faces)')
     with timings.phase('Create component'):
         occ, comp, has_com = _create_output(design, merged, base_name, com_point)
 
@@ -949,6 +1064,7 @@ def _run_shrinkwrap(design, add_com, envelope, detail, wall, manual_mass):
         for b in comp.bRepBodies:
             b.material = material
 
+    _log('Setting material and mass')
     with timings.phase('Material'):
         material = _material_copy(design, f'{base_name} material', None)
         mass = _tune_density(material, assign,
@@ -1004,6 +1120,10 @@ def _run_refill(design, body, envelope, detail, wall, manual_mass):
     label = _body_label(body)
     native = body.nativeObject or body
     root = design.rootComponent
+    _log(f'Single-body mode on "{label}" ({_describe_body(body)}) | '
+         f'fill: {"envelope" if envelope else "sealed only"} | detail: {detail} | '
+         f'wall: {wall * 10:.3g} mm | '
+         f'mass: {"manual %.6g kg" % manual_mass if manual_mass is not None else "keep"}')
 
     with timings.phase('Mass'):
         mass_before = body.getPhysicalProperties(ACCURACY).mass
@@ -1032,7 +1152,9 @@ def _run_refill(design, body, envelope, detail, wall, manual_mass):
     lines = [f'Filled cavities in "{label}" in place.', '']
     notes = [w for w in (cavity_warning, envelope_warning) if w]
 
+    _log(f'Volume added: {added:.6g} cm^3')
     if added > MIN_ADDED_VOLUME:
+        _log(f'Updating the body in the design ({filled.faces.count} faces)')
         with timings.phase('Update body'):
             new_body = _replace_body(design, body, filled)
     else:
@@ -1042,6 +1164,7 @@ def _run_refill(design, body, envelope, detail, wall, manual_mass):
             notes.append('No sealed cavity was found. Use Fill: '
                          f'"{FILL_ENVELOPE}" to fill cavities that leak to the outside.')
 
+    _log('Setting material and mass')
     with timings.phase('Material'):
         material = _own_material(design, [new_body], old_material)
         mass = _set_mass(material, [new_body], target_mass)
@@ -1064,7 +1187,9 @@ def _finish_summary(lines, notes, timings):
     if notes:
         lines += ['', 'Notes:'] + [f'- {n}' for n in notes]
     lines += ['', f'Time: {_format_seconds(timings.total())} ({timings.summary()})']
-    _log(' | '.join(l for l in lines if l))
+    if _run_log:
+        lines.append(_log_path_line())
+    _log('Summary: ' + ' | '.join(l for l in lines if l))
     return '\n'.join(lines)
 
 
@@ -1116,6 +1241,7 @@ class ShrinkwrapExecuteHandler(adsk.core.CommandEventHandler):
 
     def notify(self, args):
         ui = _app().userInterface
+        log_line = ''
         try:
             add_com, envelope, detail, wall, manual_mass = \
                 _read_options(args.command.commandInputs)
@@ -1126,15 +1252,20 @@ class ShrinkwrapExecuteHandler(adsk.core.CommandEventHandler):
             if manual_mass is not None:
                 _last_options['mass'] = manual_mass
 
-            design = _active_design()
-            if not design:
-                raise ShrinkwrapError('Open a design (model or assembly) first.')
-            single = _find_single_body(design)
-            if single:
-                summary = _run_refill(design, single, envelope, detail, wall, manual_mass)
-            else:
-                _last_options['add_com'] = add_com
-                summary = _run_shrinkwrap(design, add_com, envelope, detail, wall, manual_mass)
+            with _logged_run('Shrinkwrap'):
+                log_line = _log_path_line()
+                design = _active_design()
+                if not design:
+                    raise ShrinkwrapError('Open a design (model or assembly) first.')
+                single = _find_single_body(design)
+                if single:
+                    summary = _run_refill(design, single, envelope, detail, wall, manual_mass)
+                else:
+                    _last_options['add_com'] = add_com
+                    summary = _run_shrinkwrap(design, add_com, envelope, detail, wall,
+                                              manual_mass)
+                if summary is None:
+                    _log('Cancelled by user; changes rolled back.')
 
             if summary is None:
                 args.executeFailed = True  # cancelled: roll back
@@ -1143,10 +1274,11 @@ class ShrinkwrapExecuteHandler(adsk.core.CommandEventHandler):
             ui.messageBox(summary, 'Shrinkwrap')
         except ShrinkwrapError as e:
             args.executeFailed = True
-            ui.messageBox(str(e), 'Shrinkwrap')
+            ui.messageBox(f'{e}\n\n{log_line}'.strip(), 'Shrinkwrap')
         except Exception:
             args.executeFailed = True
-            ui.messageBox('Shrinkwrap failed:\n{}'.format(traceback.format_exc()), 'Shrinkwrap')
+            ui.messageBox(f'Shrinkwrap failed:\n{traceback.format_exc()}\n{log_line}'.strip(),
+                          'Shrinkwrap')
 
 
 class ShrinkwrapInputChangedHandler(adsk.core.InputChangedEventHandler):
@@ -1313,16 +1445,21 @@ class SetMassExecuteHandler(adsk.core.CommandEventHandler):
             if not design or not bodies:
                 raise ShrinkwrapError('Select one or more solid bodies.')
 
-            before = _current_mass(bodies)
-            current = bodies[0].material
-            material = _own_material(design, bodies, current)
-            mass = _set_mass(material, bodies, target)
-            natives = [b.nativeObject or b for b in bodies]
-            summary = (f'Mass set on {len(bodies)} {"body" if len(bodies) == 1 else "bodies"}.\n\n'
-                       f'Mass before: {before:.6g} kg\n'
-                       f'Mass now: {mass:.6g} kg\n'
-                       f'Material "{material.name}": {_density_g_cm3(mass, natives):.6g} g/cm³')
-            _log(summary.replace('\n', ' | '))
+            with _logged_run(SETMASS_CMD_NAME):
+                _log(f'Target {target:.6g} kg on: ' +
+                     ', '.join(f'"{_body_label(b)}"' for b in bodies))
+                before = _current_mass(bodies)
+                current = bodies[0].material
+                material = _own_material(design, bodies, current)
+                mass = _set_mass(material, bodies, target)
+                natives = [b.nativeObject or b for b in bodies]
+                summary = (f'Mass set on {len(bodies)} '
+                           f'{"body" if len(bodies) == 1 else "bodies"}.\n\n'
+                           f'Mass before: {before:.6g} kg\n'
+                           f'Mass now: {mass:.6g} kg\n'
+                           f'Material "{material.name}": '
+                           f'{_density_g_cm3(mass, natives):.6g} g/cm³')
+                _log(summary.replace('\n', ' | '))
             ui.messageBox(summary, SETMASS_CMD_NAME)
         except ShrinkwrapError as e:
             args.executeFailed = True
