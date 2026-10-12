@@ -31,14 +31,25 @@ Either way the whole run is one undo step.
 import adsk.core
 import adsk.fusion
 import contextlib
+import importlib
 import json
 import math
 import os
 import re
+import sys
+import threading
 import time
 import traceback
 
-SHRINKWRAP_VERSION = '1.2.3'
+# The updater lives next to this file. Its name is specific to this add-in
+# because all Fusion add-ins share one Python, so sys.modules is shared too.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import shrinkwrap_updater as updater  # noqa: E402
+importlib.reload(updater)  # pick up a new version on add-in Stop/Run
+
+SHRINKWRAP_VERSION = '1.3.0'
 
 CMD_ID = 'DaneccaShrinkwrapCmd'
 CMD_NAME = 'Shrinkwrap'
@@ -1643,6 +1654,142 @@ class SetMassCreatedHandler(adsk.core.CommandCreatedEventHandler):
 
 
 # ----------------------------------------------------------------------------
+# Updates (development guide, section 19). The network work is in
+# shrinkwrap_updater; this part is the Fusion side: a "Shrinkwrap Updates"
+# button, and a startup check that runs on a background thread so it never
+# slows Fusion's start-up, then hands any result to the main thread through a
+# custom event (the API may only be used on the main thread).
+# ----------------------------------------------------------------------------
+
+UPDATE_CMD_ID = 'DaneccaShrinkwrapUpdateCmd'
+UPDATE_CMD_NAME = 'Shrinkwrap Updates'
+UPDATE_TOOLTIP = 'Check GitHub for a newer version of the Shrinkwrap add-in and install it.'
+UPDATE_EVENT_ID = 'DaneccaShrinkwrapUpdateFound'
+UPDATE_STARTUP_DELAY = 30       # seconds after load, so Fusion has finished starting
+# Remembers which new version the user was already told about at startup, so
+# the startup prompt appears once per release (the button always works).
+UPDATE_STATE_FILE = os.path.join(LOG_DIR, 'update check.json')
+
+
+def _load_update_state():
+    try:
+        with open(UPDATE_STATE_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_update_state(data):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(UPDATE_STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def _offer_update(latest, tag, intro):
+    """Ask, then download and install release `tag`. Runs on the main thread."""
+    ui = _app().userInterface
+    answer = ui.messageBox(
+        f'{intro}\n\nInstalled: v{SHRINKWRAP_VERSION}\nLatest: v{latest}\n\n'
+        'Download and install it now? Restart Fusion afterwards to start using it.',
+        'Shrinkwrap update', adsk.core.MessageBoxButtonTypes.YesNoButtonType,
+        adsk.core.MessageBoxIconTypes.QuestionIconType)
+    if answer != adsk.core.DialogResults.DialogYes:
+        _log(f'Update to v{latest} declined')
+        return
+    try:
+        with _logged_run('Shrinkwrap update'):
+            _log(f'Installing v{latest} over v{SHRINKWRAP_VERSION}')
+            updater.download_and_install(tag, updater.cached_github_token(), log=_log)
+        ui.messageBox(f'Shrinkwrap v{latest} is installed.\n\nRestart Fusion to start using it.',
+                      'Shrinkwrap update')
+    except updater.UpdateError as e:
+        ui.messageBox(f'The update could not be installed:\n\n{e}\n\n'
+                      'Your current version is unchanged.', 'Shrinkwrap update')
+    except Exception:
+        ui.messageBox('The update could not be installed:\n\n' + traceback.format_exc() +
+                      '\nYour current version is unchanged.', 'Shrinkwrap update')
+
+
+class UpdateExecuteHandler(adsk.core.CommandEventHandler):
+    """The "Shrinkwrap Updates" button: check now, offer to install."""
+
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        ui = _app().userInterface
+        try:
+            latest, tag = updater.latest_release(updater.cached_github_token())
+            _log(f'Update check: installed v{SHRINKWRAP_VERSION}, latest v{latest}')
+            if not updater.is_newer(latest, SHRINKWRAP_VERSION):
+                ui.messageBox(f'Shrinkwrap is up to date (v{SHRINKWRAP_VERSION}).',
+                              'Shrinkwrap update')
+                return
+            _offer_update(latest, tag, 'A newer version of Shrinkwrap is available.')
+        except updater.UpdateError as e:
+            ui.messageBox(f'Could not check for updates:\n\n{e}', 'Shrinkwrap update')
+        except Exception:
+            ui.messageBox('Could not check for updates:\n\n' + traceback.format_exc(),
+                          'Shrinkwrap update')
+
+
+class UpdateCreatedHandler(adsk.core.CommandCreatedEventHandler):
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        try:
+            cmd = args.command
+            cmd.isAutoExecute = True  # no dialog
+            on_execute = UpdateExecuteHandler()
+            cmd.execute.add(on_execute)
+            handlers.append(on_execute)
+        except Exception:
+            _app().userInterface.messageBox(traceback.format_exc(), UPDATE_CMD_NAME)
+
+
+class UpdateFoundHandler(adsk.core.CustomEventHandler):
+    """Main-thread end of the startup check: prompt once per new version."""
+
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        try:
+            info = json.loads(args.additionalInfo)
+            latest, tag = info['latest'], info['tag']
+            state = _load_update_state()
+            if state.get('notified') == latest:
+                _log(f'v{latest} is available (already offered at an earlier start)')
+                return
+            state['notified'] = latest
+            _save_update_state(state)
+            _offer_update(latest, tag, 'A new version of the Shrinkwrap add-in is available.')
+        except Exception:
+            _log('Startup update prompt failed:\n' + traceback.format_exc())
+
+
+def _start_update_check():
+    """Check GitHub on a background thread; never blocks or bothers on failure."""
+    app = _app()
+
+    def worker():
+        try:
+            time.sleep(UPDATE_STARTUP_DELAY)
+            latest, tag = updater.latest_release(updater.cached_github_token())
+            if updater.is_newer(latest, SHRINKWRAP_VERSION):
+                app.fireCustomEvent(UPDATE_EVENT_ID, json.dumps({'latest': latest, 'tag': tag}))
+        except Exception:
+            pass  # offline, rate-limited, ...: stay quiet; the button still works
+
+    threading.Thread(target=worker, name='ShrinkwrapUpdateCheck', daemon=True).start()
+
+
+# ----------------------------------------------------------------------------
 # Add-in entry points
 # ----------------------------------------------------------------------------
 
@@ -1650,6 +1797,8 @@ COMMANDS = (
     (CMD_ID, CMD_NAME, CMD_TOOLTIP, './resources/ShrinkwrapButton', ShrinkwrapCreatedHandler),
     (SETMASS_CMD_ID, SETMASS_CMD_NAME, SETMASS_TOOLTIP, './resources/SetMassButton',
      SetMassCreatedHandler),
+    (UPDATE_CMD_ID, UPDATE_CMD_NAME, UPDATE_TOOLTIP, './resources/UpdateButton',
+     UpdateCreatedHandler),
 )
 
 
@@ -1676,12 +1825,30 @@ def run(context):
                 ctrl.isVisible = True
         _log(f'v{SHRINKWRAP_VERSION} loaded')
 
+        try:
+            app = _app()
+            try:
+                app.unregisterCustomEvent(UPDATE_EVENT_ID)  # left over from an unclean stop
+            except Exception:
+                pass
+            update_event = app.registerCustomEvent(UPDATE_EVENT_ID)
+            on_update_found = UpdateFoundHandler()
+            update_event.add(on_update_found)
+            handlers.append(on_update_found)
+            _start_update_check()
+        except Exception:
+            _log('Startup update check not started:\n' + traceback.format_exc())
+
     except Exception:
         _app().userInterface.messageBox(
             'Shrinkwrap failed to start:\n{}'.format(traceback.format_exc()), 'Shrinkwrap')
 
 
 def stop(context):
+    try:
+        _app().unregisterCustomEvent(UPDATE_EVENT_ID)
+    except Exception:
+        pass
     try:
         ui = _app().userInterface
         workspace = ui.workspaces.itemById(WORKSPACE_ID)

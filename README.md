@@ -1,6 +1,6 @@
 # Shrinkwrap
 
-Fusion add-in with two buttons in **Solid → Modify**. Version 1.2.3.
+Fusion add-in with buttons in **Solid → Modify**. Version 1.3.0.
 
 - **Shrinkwrap** turns the open part or assembly into one solid body in a new internal
   component, with the same mass and a marker at the original center of mass. On a design
@@ -8,6 +8,7 @@ Fusion add-in with two buttons in **Solid → Modify**. Version 1.2.3.
   *Single-body mode*).
 - **Set Mass** gives the selected bodies an exact total mass by adjusting their material's
   density.
+- **Shrinkwrap Updates** checks GitHub for a newer version and installs it (see *Updates*).
 
 ## Shrinkwrap dialog
 
@@ -107,12 +108,34 @@ file); both files are in the log folder.
   open the referenced design instead.
 - Every run is a single undo step and can be cancelled from the progress dialog.
 
-## Install / update
+## Install
 
 Run `Deploy.bat`, then in Fusion: Utilities → Add-Ins → Shrinkwrap → Stop, then Run (or
 restart Fusion). Installs to `%APPDATA%\Autodesk\ApplicationPlugins\Shrinkwrap.bundle`.
 
+## Updates
+
+The add-in updates itself from this GitHub repo (`shrinkwrap_updater.py`, following
+section 19 of the Fusion Plugin Development Guide):
+
+- **At startup** it checks GitHub in the background (30 s after Fusion loads, so it never
+  slows start-up). If a newer release exists it asks once per release: *Download and
+  install it now?* Offline or any error: it stays silent.
+- **Solid → Modify → Shrinkwrap Updates** checks on demand and offers to install.
+- Installing downloads the release, checks it (complete bundle, version matches the
+  tag), copies it next to the live bundle and swaps the two folders, restoring the old
+  one if the swap fails. Restart Fusion to use the new version.
+- The repo is public, so no GitHub login and no Git install are needed. A token already
+  cached by Git Credential Manager is used if present (higher GitHub rate limit), but
+  you're never prompted.
+
 ## Releasing
 
-Bump the version in four places: `PackageContents.xml` (×2), `Shrinkwrap.manifest`, and
-`SHRINKWRAP_VERSION` in `Shrinkwrap.py`.
+1. Bump the version in four places: `PackageContents.xml` (×2), `Shrinkwrap.manifest`,
+   and `SHRINKWRAP_VERSION` in `Shrinkwrap.py`.
+2. Commit and push.
+3. Tag the commit `vX.Y.Z` (matching `SHRINKWRAP_VERSION` — the updater refuses a
+   mismatch) and push the tag: `git tag v1.3.0 && git push origin v1.3.0`.
+
+Users get the update offered at their next Fusion start. An untagged commit is never
+offered.
