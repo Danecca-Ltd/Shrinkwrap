@@ -49,7 +49,7 @@ if _HERE not in sys.path:
 import shrinkwrap_updater as updater  # noqa: E402
 importlib.reload(updater)  # pick up a new version on add-in Stop/Run
 
-SHRINKWRAP_VERSION = '1.3.0'
+SHRINKWRAP_VERSION = '1.3.1'
 
 CMD_ID = 'DaneccaShrinkwrapCmd'
 CMD_NAME = 'Shrinkwrap'
